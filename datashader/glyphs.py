@@ -73,6 +73,31 @@ class _PointLike(Glyph):
         return np.nanmin(ys), np.nanmax(ys)
 
 
+class _PolygonLike(_PointLike):
+    """_PointLike class, with Triangle-specific methods overriden.
+
+    Key differences from _PointLike:
+        - self.x and self.y are tuples of strs, instead of just strs
+        - self.xs and self.ys are available, as aliases to self.x and self.y
+    """
+    @property
+    def xs(self):
+        return self.x
+
+    @property
+    def ys(self):
+        return self.y
+
+    @property
+    def inputs(self):
+        return tuple(zip(self.xs, self.ys))
+
+    def validate(self, in_dshape):
+        for col in (self.xs + self.ys):
+            if not isreal(in_dshape.measure[col]):
+                raise ValueError('{} must be real'.format(col))
+
+
 class Point(_PointLike):
     """A point, with center at ``x`` and ``y``.
 
@@ -143,7 +168,32 @@ class Line(_PointLike):
         return extend
 
 
+class Triangles(_PolygonLike):
+    """An unstructured mesh of triangles, with vertices defined by ``xs`` and ``ys``.
+
+    Parameters
+    ----------
+    xs, ys : list of str
+        Column names of x and y coordinates of each vertex.
+    """
+    @memoize
+    def _build_extend(self, x_mapper, y_mapper, info, append):
+        map_onto_pixel = _build_map_onto_pixel(x_mapper, y_mapper)
+        draw_triangle = _build_draw_triangle(append)
+        extend_triangles = _build_extend_triangles(draw_triangle, map_onto_pixel)
+        x_names = self.xs
+        y_names = self.ys
+
+        def extend(aggs, df, vt, bounds):
+            verts = df[x_names + y_names].values
+            cols = aggs + info(df)
+            extend_triangles(vt, bounds, verts, *cols)
+
+        return extend
+
+
 # -- Helpers for computing line geometry --
+
 
 def _build_map_onto_pixel(x_mapper, y_mapper):
     @ngjit
@@ -313,3 +363,63 @@ def _build_extend_line(draw_line, map_onto_pixel):
             i += 1
 
     return extend_line
+
+
+@ngjit
+def edge_func(a, b, c):
+    return (c[0] - a[0]) * (b[1] - a[1]) - (c[1] - a[1]) * (b[0] - a[0])
+
+def _build_draw_triangle(append):
+    """Specialize a triangle plotting kernel for a given append/axis combination"""
+    @ngjit
+    def draw_triangle(n, verts, bbox, *aggs_and_cols):
+        """Draw a triangle on a grid.
+
+        This method plots a triangle with integer coordinates onto a pixel
+        grid. The vertices are assumed to have already been scaled, transformed,
+        and clipped within the bounds.
+        """
+        a, b, c = verts
+        agg = aggs_and_cols[0]
+        minx, maxx, miny, maxy = bbox
+        for i in range(minx, maxx+1):
+            for j in range(miny, maxy+1):
+                pt = (i, j)
+                inside_tri = edge_func(a, b, pt) >= 0 and \
+                             edge_func(b, c, pt) >= 0 and \
+                             edge_func(c, a, pt) >= 0
+                if inside_tri:
+                    append(n, i, j, *aggs_and_cols)
+
+
+    return draw_triangle
+
+
+def _build_extend_triangles(draw_triangle, map_onto_pixel):
+    @ngjit
+    def extend_triangles(vt, bounds, verts, *aggs_and_cols):
+        """Aggregate along a triangle formed by arrays of CCW vertices. Each row
+        corresponds to a single triangle definition.
+        """
+        xmin, xmax, ymin, ymax = bounds
+        for n in range(verts.shape[0]):
+            aix, bix, cix, aiy, biy, ciy = verts[n]
+
+            # Map triangle vertices onto pixels
+            ax, ay = map_onto_pixel(vt, bounds, aix, aiy)
+            bx, by = map_onto_pixel(vt, bounds, bix, biy)
+            cx, cy = map_onto_pixel(vt, bounds, cix, ciy)
+
+            # Get bounding box (for clipping)
+            # TODO: Add more tests, to check if more needs to be done here
+            #     , e.g., wrt ``bounds``
+            minx = min(ax, bx, cx)
+            maxx = max(ax, bx, cx)
+            miny = min(ay, by, cy)
+            maxy = max(ay, by, cy)
+
+            mapped_verts = [(ax, ay), (bx, by), (cx, cy)]
+            bbox = minx, maxx, miny, maxy
+            draw_triangle(n, mapped_verts, bbox, *aggs_and_cols)
+
+    return extend_triangles
